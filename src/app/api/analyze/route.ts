@@ -158,17 +158,26 @@ async function ocrImage(file: File) {
   // 3. Try tesseract.js (Pure JS / WebAssembly with 15s timeout - works on Netlify, Vercel, Linux)
   try {
     const { createWorker } = await import("tesseract.js");
-    const ocrPromise = (async () => {
-      const worker = await createWorker("eng");
-      const res = await worker.recognize(buffer);
-      await worker.terminate();
-      return res?.data?.text?.trim() ?? "";
-    })();
-    const timeoutPromise = new Promise<string>((_, reject) =>
-      setTimeout(() => reject(new Error("OCR request timed out")), 15000),
-    );
-    const text = await Promise.race([ocrPromise, timeoutPromise]);
-    if (text.length >= 15) return text;
+    let worker: any = null;
+    try {
+      const ocrPromise = (async () => {
+        worker = await createWorker("eng", 1, {
+          cachePath: tmpdir(),
+          logger: () => {},
+        });
+        const res = await worker.recognize(buffer);
+        return res?.data?.text?.trim() ?? "";
+      })();
+      const timeoutPromise = new Promise<string>((_, reject) =>
+        setTimeout(() => reject(new Error("OCR request timed out")), 15000),
+      );
+      const text = await Promise.race([ocrPromise, timeoutPromise]);
+      if (text.length >= 15) return text;
+    } finally {
+      if (worker) {
+        await worker.terminate().catch(() => undefined);
+      }
+    }
   } catch {
     // Fall through to final error
   }
