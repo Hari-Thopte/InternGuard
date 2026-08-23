@@ -1,0 +1,9 @@
+
+> internguard11@1.0.0 start
+> next start -p 3112
+
+▲ Next.js 16.3.2
+- Local:         http://localhost:3112
+- Network:       http://192.168.1.103:3112
+✓ Ready in 145ms
+✓ Running next.config.mjs took 19ms
