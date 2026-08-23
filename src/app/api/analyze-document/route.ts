@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { NextResponse } from "next/server";
+import { PDFParse } from "pdf-parse";
 import {
   analyzeDocument,
   type DocumentWorkerResult,
@@ -54,19 +55,6 @@ function hasCapacity(key: string) {
   return true;
 }
 
-function workerMessage(error: unknown) {
-  const stderr =
-    typeof error === "object" && error && "stderr" in error
-      ? String((error as { stderr?: unknown }).stderr ?? "")
-      : "";
-  try {
-    const parsed = JSON.parse(stderr.trim()) as { error?: string };
-    return parsed.error || "The document could not be inspected.";
-  } catch {
-    return stderr.trim() || "The document could not be inspected.";
-  }
-}
-
 function validWorkerResult(value: unknown): value is DocumentWorkerResult {
   if (!value || typeof value !== "object") return false;
   const result = value as Partial<DocumentWorkerResult>;
@@ -90,6 +78,116 @@ function validWorkerResult(value: unknown): value is DocumentWorkerResult {
       (value) => typeof value === "string" && value.length <= 2_048,
     )
   );
+}
+
+async function runTesseractJSOcr(buffer: Buffer): Promise<string> {
+  const { createWorker } = await import("tesseract.js");
+  const ocrPromise = (async () => {
+    const worker = await createWorker("eng");
+    const res = await worker.recognize(buffer);
+    await worker.terminate();
+    return res?.data?.text?.trim() ?? "";
+  })();
+  const timeoutPromise = new Promise<string>((_, reject) =>
+    setTimeout(() => reject(new Error("OCR request timed out")), 15000),
+  );
+  return await Promise.race([ocrPromise, timeoutPromise]);
+}
+
+async function parseDocumentInJS(
+  buffer: Buffer,
+  kind: "pdf" | "image" | "docx",
+): Promise<DocumentWorkerResult> {
+  if (kind === "pdf") {
+    try {
+      const parser = new PDFParse({ data: new Uint8Array(buffer) });
+      const textResult = await parser.getText();
+      const infoResult = await parser.getInfo().catch(() => null);
+      await parser.destroy().catch(() => undefined);
+
+      let text = (textResult?.text || "").trim();
+      const pageCount = Math.max(textResult?.pages?.length || 1, 1);
+      const info = (infoResult?.info || {}) as Record<string, unknown>;
+      const metadata: Record<string, string> = {};
+
+      if (typeof info.Author === "string" && info.Author)
+        metadata.author = info.Author;
+      if (typeof info.Creator === "string" && info.Creator)
+        metadata.creator = info.Creator;
+      if (typeof info.Producer === "string" && info.Producer)
+        metadata.producer = info.Producer;
+      if (typeof info.CreationDate === "string" && info.CreationDate)
+        metadata.creationDate = info.CreationDate;
+      if (typeof info.ModDate === "string" && info.ModDate)
+        metadata.modDate = info.ModDate;
+
+      const rawStr = buffer.toString("binary");
+      const sigMatches = rawStr.match(/\/Type\s*\/Sig|\/ByteRange\b/g);
+      const signatureFields = sigMatches ? Math.min(sigMatches.length, 10) : 0;
+
+      let usedOcr = false;
+      if (text.length < 20) {
+        try {
+          const ocrText = await runTesseractJSOcr(buffer);
+          if (ocrText.length > text.length) {
+            text = ocrText;
+            usedOcr = true;
+          }
+        } catch {
+          // ignore OCR failure
+        }
+      }
+
+      return {
+        text: text.slice(0, 40_000),
+        pageCount: Math.min(pageCount, 100),
+        metadata,
+        signatureFields,
+        usedOcr,
+        qrCodes: [],
+      };
+    } catch {
+      throw new Error("The PDF document could not be read.");
+    }
+  }
+
+  if (kind === "image") {
+    try {
+      const text = await runTesseractJSOcr(buffer);
+      return {
+        text: text.slice(0, 40_000),
+        pageCount: 1,
+        metadata: {},
+        signatureFields: 0,
+        usedOcr: true,
+        qrCodes: [],
+      };
+    } catch {
+      throw new Error("The document image could not be processed.");
+    }
+  }
+
+  if (kind === "docx") {
+    const rawStr = buffer.toString("utf-8");
+    const textMatches = [...rawStr.matchAll(/<w:t[^>]*>(.*?)<\/w:t>/g)];
+    const text = textMatches
+      .map((m) => m[1])
+      .join(" ")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&")
+      .trim();
+    return {
+      text: text.slice(0, 40_000),
+      pageCount: 1,
+      metadata: {},
+      signatureFields: 0,
+      usedOcr: false,
+      qrCodes: [],
+    };
+  }
+
+  throw new Error("Unsupported document type.");
 }
 
 export async function POST(request: Request) {
@@ -126,37 +224,53 @@ export async function POST(request: Request) {
       );
 
     const sha256 = createHash("sha256").update(buffer).digest("hex");
-    temporaryDirectory = await mkdtemp(join(tmpdir(), "internguard-document-"));
-    const temporaryFile = join(
-      temporaryDirectory,
-      "source" + inspected.extension,
-    );
-    await writeFile(temporaryFile, buffer, { flag: "wx" });
+    let worker: DocumentWorkerResult | undefined;
 
-    let worker: DocumentWorkerResult;
-    try {
-      const { stdout } = await runFile(
-        process.env.PYTHON_COMMAND || "python",
-        [
-          join(process.cwd(), "scripts", "document_analyzer.py"),
-          temporaryFile,
-          inspected.kind,
-        ],
-        {
-          timeout: 45_000,
-          maxBuffer: 2 * 1024 * 1024,
-          windowsHide: true,
-        },
-      );
-      const parsed: unknown = JSON.parse(stdout);
-      if (!validWorkerResult(parsed))
-        throw new Error("The document worker returned an invalid result.");
-      worker = parsed;
-    } catch (error) {
-      return NextResponse.json(
-        { error: workerMessage(error) },
-        { status: 422 },
-      );
+    // 1. Try Python worker if python command is configured and available
+    if (process.env.PYTHON_COMMAND) {
+      try {
+        temporaryDirectory = await mkdtemp(
+          join(tmpdir(), "internguard-document-"),
+        );
+        const temporaryFile = join(
+          temporaryDirectory,
+          "source" + inspected.extension,
+        );
+        await writeFile(temporaryFile, buffer, { flag: "wx" });
+
+        const { stdout } = await runFile(
+          process.env.PYTHON_COMMAND,
+          [
+            join(process.cwd(), "scripts", "document_analyzer.py"),
+            temporaryFile,
+            inspected.kind,
+          ],
+          {
+            timeout: 45_000,
+            maxBuffer: 2 * 1024 * 1024,
+            windowsHide: true,
+          },
+        );
+        const parsed: unknown = JSON.parse(stdout);
+        if (validWorkerResult(parsed)) {
+          worker = parsed;
+        }
+      } catch {
+        // Fall back to JS parser below
+      }
+    }
+
+    // 2. Pure JS / WebAssembly document parser (works on Netlify, Vercel, Linux, Windows)
+    if (!worker) {
+      try {
+        worker = await parseDocumentInJS(buffer, inspected.kind);
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : "The document could not be inspected.";
+        return NextResponse.json({ error: message }, { status: 422 });
+      }
     }
 
     const report = analyzeDocument({
