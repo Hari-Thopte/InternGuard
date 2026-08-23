@@ -526,25 +526,25 @@ export function ReportView({
         </div>
 
         {/* Section 6: Action Buttons Panel */}
-        <div className="panel p-5 sm:p-6 flex flex-wrap items-center justify-between gap-4 w-full">
+        <div className="panel p-4 sm:p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 w-full">
           <div className="flex items-center gap-3">
             <ShieldCheck className="text-accent shrink-0" size={20} />
-            <p className="text-sm text-muted">
+            <p className="text-xs sm:text-sm text-muted">
               Analysis verified in browser. Export PDF or copy summary for your records.
             </p>
           </div>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={copy} className="button-secondary">
+          <div className="flex flex-col sm:flex-row flex-wrap gap-2 w-full sm:w-auto">
+            <button onClick={copy} className="button-secondary w-full sm:w-auto">
               <Clipboard size={16} /> Copy summary
             </button>
             <button
               onClick={() => window.print()}
-              className="button-secondary"
+              className="button-secondary w-full sm:w-auto"
             >
               <FileDown size={16} /> Export PDF
             </button>
             {onReset && (
-              <button onClick={onReset} className="button-primary">
+              <button onClick={onReset} className="button-primary w-full sm:w-auto">
                 New scan
               </button>
             )}
