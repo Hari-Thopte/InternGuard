@@ -105,7 +105,17 @@ async function ocrImage(file: File) {
       "The file content does not match a supported PNG, JPEG, or WebP screenshot.",
     );
 
-  // Try Tesseract OCR if executable exists
+  // 1. Try Windows Native WinRT OCR first when running on Windows (instant local execution)
+  if (process.platform === "win32") {
+    try {
+      const text = await runWindowsNativeOcr(buffer);
+      if (text.length >= 15) return text;
+    } catch {
+      // Fall through to Tesseract
+    }
+  }
+
+  // 2. Try native Tesseract CLI if installed locally
   const windowsDefault = "C:\\Program Files\\Tesseract-OCR\\tesseract.exe";
   const tesseractAvailable =
     process.env.TESSERACT_COMMAND ||
@@ -141,18 +151,26 @@ async function ocrImage(file: File) {
       });
       if (stdout.trim().length >= 15) return stdout.trim();
     } catch {
-      // Fallback to Windows Native OCR engine
+      // Fall through to tesseract.js
     }
   }
 
-  // Windows Native WinRT OCR Fallback
-  if (process.platform === "win32") {
-    try {
-      const text = await runWindowsNativeOcr(buffer);
-      if (text.length >= 15) return text;
-    } catch {
-      // Fallback error message below
-    }
+  // 3. Try tesseract.js (Pure JS / WebAssembly with 15s timeout - works on Netlify, Vercel, Linux)
+  try {
+    const { createWorker } = await import("tesseract.js");
+    const ocrPromise = (async () => {
+      const worker = await createWorker("eng");
+      const res = await worker.recognize(buffer);
+      await worker.terminate();
+      return res?.data?.text?.trim() ?? "";
+    })();
+    const timeoutPromise = new Promise<string>((_, reject) =>
+      setTimeout(() => reject(new Error("OCR request timed out")), 15000),
+    );
+    const text = await Promise.race([ocrPromise, timeoutPromise]);
+    if (text.length >= 15) return text;
+  } catch {
+    // Fall through to final error
   }
 
   throw new Error(
