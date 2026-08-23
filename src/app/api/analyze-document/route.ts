@@ -82,16 +82,50 @@ function validWorkerResult(value: unknown): value is DocumentWorkerResult {
 
 async function runTesseractJSOcr(buffer: Buffer): Promise<string> {
   const { createWorker } = await import("tesseract.js");
-  const ocrPromise = (async () => {
-    const worker = await createWorker("eng");
-    const res = await worker.recognize(buffer);
-    await worker.terminate();
-    return res?.data?.text?.trim() ?? "";
-  })();
-  const timeoutPromise = new Promise<string>((_, reject) =>
-    setTimeout(() => reject(new Error("OCR request timed out")), 15000),
+  let worker: any = null;
+  try {
+    const ocrPromise = (async () => {
+      worker = await createWorker("eng", 1, {
+        cachePath: tmpdir(),
+        logger: () => {},
+      });
+      const res = await worker.recognize(buffer);
+      return res?.data?.text?.trim() ?? "";
+    })();
+    const timeoutPromise = new Promise<string>((_, reject) =>
+      setTimeout(() => reject(new Error("OCR request timed out")), 15000),
+    );
+    return await Promise.race([ocrPromise, timeoutPromise]);
+  } finally {
+    if (worker) {
+      await worker.terminate().catch(() => undefined);
+    }
+  }
+}
+
+function extractRawPdfStrings(buffer: Buffer): string {
+  const rawStr = buffer.toString("binary");
+  const textBlocks: string[] = [];
+  const matches = rawStr.match(
+    /(\((?:[^()\\]|\\.){3,}\)\s*(?:Tj|TJ|\'))|(\[(?:\((?:[^()\\]|\\.){1,}\)\s*)+\]\s*TJ)/g,
   );
-  return await Promise.race([ocrPromise, timeoutPromise]);
+  if (matches) {
+    for (const match of matches) {
+      const strings = match.match(/\(([^()\\]|\\.)*\)/g);
+      if (strings) {
+        for (const s of strings) {
+          const cleaned = s
+            .slice(1, -1)
+            .replace(/\\([()])/g, "$1")
+            .trim();
+          if (cleaned.length > 2 && /[\w\s]{3,}/.test(cleaned)) {
+            textBlocks.push(cleaned);
+          }
+        }
+      }
+    }
+  }
+  return textBlocks.join(" ").replace(/\s+/g, " ").trim();
 }
 
 async function parseDocumentInJS(
@@ -101,7 +135,7 @@ async function parseDocumentInJS(
   if (kind === "pdf") {
     try {
       const parser = new PDFParse({ data: new Uint8Array(buffer) });
-      const textResult = await parser.getText();
+      const textResult = await parser.getText().catch(() => null);
       const infoResult = await parser.getInfo().catch(() => null);
       await parser.destroy().catch(() => undefined);
 
@@ -127,14 +161,9 @@ async function parseDocumentInJS(
 
       let usedOcr = false;
       if (text.length < 20) {
-        try {
-          const ocrText = await runTesseractJSOcr(buffer);
-          if (ocrText.length > text.length) {
-            text = ocrText;
-            usedOcr = true;
-          }
-        } catch {
-          // ignore OCR failure
+        const rawFallback = extractRawPdfStrings(buffer);
+        if (rawFallback.length > text.length) {
+          text = rawFallback;
         }
       }
 
