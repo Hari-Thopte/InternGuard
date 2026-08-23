@@ -251,24 +251,82 @@ export function Analyzer() {
               : { sourceType: "url", url },
           ),
         });
-      const data = (await response.json().catch(() => null)) as {
-        error?: string;
-        kind?: string;
-      } | null;
+
+      let data: Record<string, unknown> | null = null;
+      try {
+        data = (await response.json()) as Record<string, unknown> | null;
+      } catch {
+        if (response.status === 504 || response.status === 502) {
+          throw new Error(
+            "The server timed out while processing this request. Try pasting the visible text directly.",
+          );
+        }
+      }
+
+      // If server OCR failed or timed out for an image/screenshot, attempt client-side browser OCR fallback
+      if (
+        (!response.ok || !data) &&
+        (tab === "image" || (tab === "document" && documentFile && /^image\//i.test(documentFile.type)))
+      ) {
+        try {
+          const fileToOcr = tab === "image" ? file! : documentFile!;
+          const { createWorker } = await import("tesseract.js");
+          const worker = await createWorker("eng");
+          const res = await worker.recognize(fileToOcr);
+          await worker.terminate().catch(() => undefined);
+          const extractedText = res?.data?.text?.trim() ?? "";
+          if (extractedText.length >= 15) {
+            const fallbackResponse = await fetch("/api/analyze", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                sourceType: "text",
+                content: extractedText,
+              }),
+            });
+            if (fallbackResponse.ok) {
+              const fallbackData = (await fallbackResponse.json()) as RiskReport;
+              setReport(fallbackData);
+              if (!saveScanReport(fallbackData))
+                setStorageWarning(
+                  "The report is ready, but this browser could not save it to local history.",
+                );
+              setTimeout(() => {
+                const result = document.getElementById("report");
+                result?.focus({ preventScroll: true });
+                result?.scrollIntoView({
+                  behavior: matchMedia("(prefers-reduced-motion: reduce)").matches
+                    ? "auto"
+                    : "smooth",
+                });
+              }, 80);
+              return;
+            }
+          }
+        } catch {
+          // Client OCR fallback failed, proceed to error display
+        }
+      }
+
       if (!data)
         throw new Error(
-          "The analysis service returned an unreadable response. Please try again.",
+          "The analysis service experienced a server issue. Try pasting the text directly.",
         );
-      if (!response.ok) throw new Error(data.error || "Analysis failed.");
+      if (!response.ok)
+        throw new Error(
+          (typeof data.error === "string" && data.error) ||
+            "Analysis could not be completed.",
+        );
+
       if (tab === "document") {
-        const result = data as DocumentReport;
+        const result = data as unknown as DocumentReport;
         setDocumentReport(result);
         if (!saveDocumentReport(result))
           setStorageWarning(
             "The report is ready, but this browser could not save it to local history.",
           );
       } else {
-        const result = data as RiskReport;
+        const result = data as unknown as RiskReport;
         setReport(result);
         if (!saveScanReport(result))
           setStorageWarning(
@@ -333,12 +391,12 @@ export function Analyzer() {
     <div className="space-y-8">
       <section className="panel overflow-hidden">
         <div className="grid lg:grid-cols-[16rem_1fr]">
-          <aside className="border-b border-line bg-surface p-4 lg:border-b-0 lg:border-r">
-            <p className="eyebrow px-2 py-3">Source channel</p>
+          <aside className="border-b border-line bg-surface p-3.5 sm:p-4 lg:border-b-0 lg:border-r">
+            <p className="eyebrow px-2 py-2 text-[10px] lg:py-3">Source channel</p>
             <div
               role="tablist"
               aria-label="Analysis source"
-              className="grid gap-2 sm:grid-cols-2 lg:grid-cols-1"
+              className="grid grid-cols-2 gap-2 lg:grid-cols-1"
             >
               {sourceTabs.map((t, index) => (
                 <button
@@ -382,7 +440,7 @@ export function Analyzer() {
                       document.getElementById(`source-tab-${next}`)?.focus(),
                     );
                   }}
-                  className={`relative flex min-h-14 items-center gap-3 rounded-xl px-3 text-left text-sm font-semibold transition-colors ${tab === t.id ? "text-canvas" : "text-muted hover:bg-raised hover:text-ink"}`}
+                  className={`relative flex min-h-12 items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-semibold sm:px-3 sm:text-sm lg:min-h-14 lg:gap-3 transition-colors ${tab === t.id ? "text-canvas" : "text-muted hover:bg-raised hover:text-ink"}`}
                 >
                   {tab === t.id && (
                     <motion.div
@@ -391,14 +449,14 @@ export function Analyzer() {
                       transition={{ type: "spring", stiffness: 450, damping: 32 }}
                     />
                   )}
-                  <span className="relative z-10 flex items-center gap-3">
-                    <t.icon size={18} />
-                    {t.label}
+                  <span className="relative z-10 flex items-center gap-2 sm:gap-3 truncate">
+                    <t.icon size={16} className="shrink-0 sm:size-[18px]" />
+                    <span className="truncate">{t.label}</span>
                   </span>
                 </button>
               ))}
             </div>
-            <div className="mt-7 border-t border-line pt-5">
+            <div className="mt-5 hidden border-t border-line pt-4 lg:block lg:mt-7 lg:pt-5">
               <div className="flex items-center gap-2 text-sm font-semibold">
                 <History size={16} className="text-accent" />
                 {tab === "document" ? "Recent documents" : "Recent scans"}
@@ -439,19 +497,19 @@ export function Analyzer() {
               </div>
             </div>
           </aside>
-          <div className="p-5 sm:p-8">
-            <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="p-4 sm:p-8">
+            <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p className="eyebrow">New investigation</p>
-                <h2 className="mt-2 text-3xl font-semibold">
+                <h2 className="mt-1 text-2xl font-semibold sm:text-3xl tracking-tight">
                   Bring the evidence you received.
                 </h2>
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-muted">
+                <p className="mt-2 max-w-2xl text-xs leading-5 text-muted sm:text-sm sm:leading-6">
                   InternGuard applies traceable rules. It does not train on your
                   submission or declare an employer fraudulent.
                 </p>
               </div>
-              <span className="rounded-full border border-low/30 bg-low/10 px-3 py-1 text-xs text-low">
+              <span className="shrink-0 rounded-full border border-low/30 bg-low/10 px-2.5 py-1 text-[11px] sm:text-xs text-low">
                 Local heuristic engine
               </span>
             </div>
@@ -459,11 +517,11 @@ export function Analyzer() {
               id={`source-panel-${tab}`}
               role="tabpanel"
               aria-labelledby={`source-tab-${tab}`}
-              className="mt-7"
+              className="mt-5 sm:mt-7"
             >
               {tab === "text" && (
                 <>
-                  <label htmlFor="content" className="text-sm font-semibold">
+                  <label htmlFor="content" className="text-xs font-semibold sm:text-sm">
                     Message or listing text
                   </label>
                   <textarea
@@ -471,13 +529,13 @@ export function Analyzer() {
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     disabled={busy}
-                    rows={10}
+                    rows={6}
                     maxLength={20000}
                     placeholder="Paste the recruiter message, email, or internship listing exactly as received…"
-                    className="mt-2 w-full resize-y rounded-xl border border-line bg-canvas p-4 text-sm leading-7 outline-none focus:border-accent"
+                    className="mt-2 w-full resize-y rounded-xl border border-line bg-canvas p-3 sm:p-4 text-xs sm:text-sm leading-6 sm:leading-7 outline-none focus:border-accent"
                   />
-                  <div className="mt-2 flex justify-between text-xs text-muted">
-                    <button onClick={sample} className="hover:text-accent">
+                  <div className="mt-2 flex items-center justify-between text-xs text-muted">
+                    <button onClick={sample} className="hover:text-accent font-medium">
                       Load suspicious example
                     </button>
                     <span>{text.length.toLocaleString()} / 20,000</span>
@@ -486,7 +544,7 @@ export function Analyzer() {
               )}
               {tab === "url" && (
                 <>
-                  <label htmlFor="url" className="text-sm font-semibold">
+                  <label htmlFor="url" className="text-xs font-semibold sm:text-sm">
                     Public internship URL
                   </label>
                   <input
@@ -496,7 +554,7 @@ export function Analyzer() {
                     onChange={(e) => setUrl(e.target.value)}
                     disabled={busy}
                     placeholder="https://company.example/careers/internship"
-                    className="mt-2 h-14 w-full rounded-xl border border-line bg-canvas px-4 outline-none focus:border-accent"
+                    className="mt-2 h-12 sm:h-14 w-full rounded-xl border border-line bg-canvas px-3.5 sm:px-4 text-xs sm:text-sm outline-none focus:border-accent"
                   />
                   <p className="mt-2 text-xs leading-5 text-muted">
                     Only public HTTP(S) pages are retrieved. Private networks,
@@ -515,7 +573,7 @@ export function Analyzer() {
                     onDragOver={(event) => event.preventDefault()}
                     onDragLeave={() => setDragging(null)}
                     onDrop={(event) => dropFile(event, "image")}
-                    className={`grid min-h-60 cursor-pointer place-items-center rounded-xl border border-dashed bg-canvas p-6 text-center transition ${dragging === "image" ? "border-accent bg-accent/10 shadow-[0_0_35px_rgb(var(--accent)/.12)]" : "border-line hover:border-accent"}`}
+                    className={`grid min-h-48 sm:min-h-60 cursor-pointer place-items-center rounded-xl border border-dashed bg-canvas p-4 sm:p-6 text-center transition ${dragging === "image" ? "border-accent bg-accent/10 shadow-[0_0_35px_rgb(var(--accent)/.12)]" : "border-line hover:border-accent"}`}
                   >
                     <input
                       ref={screenshotInput}
@@ -534,15 +592,15 @@ export function Analyzer() {
                           width={720}
                           height={480}
                           unoptimized
-                          className="max-h-52 w-auto rounded-lg object-contain"
+                          className="max-h-48 sm:max-h-52 w-auto rounded-lg object-contain"
                         />
                       ) : (
                         <>
-                          <UploadCloud className="mx-auto text-accent" />
-                          <strong className="mt-3 block">
+                          <UploadCloud className="mx-auto text-accent" size={32} />
+                          <strong className="mt-2.5 block text-xs sm:text-sm">
                             Drop or choose a screenshot
                           </strong>
-                          <span className="mt-2 block text-xs text-muted">
+                          <span className="mt-1.5 block text-[11px] sm:text-xs text-muted">
                             PNG, JPEG, or WebP · maximum 5 MB
                           </span>
                         </>
@@ -557,7 +615,7 @@ export function Analyzer() {
                         if (screenshotInput.current)
                           screenshotInput.current.value = "";
                       }}
-                      className="mt-3 inline-flex items-center gap-2 text-xs text-muted"
+                      className="mt-3 inline-flex items-center gap-2 text-xs text-muted hover:text-ink"
                     >
                       <X size={14} />
                       Remove {file.name}
@@ -575,7 +633,7 @@ export function Analyzer() {
                     onDragOver={(event) => event.preventDefault()}
                     onDragLeave={() => setDragging(null)}
                     onDrop={(event) => dropFile(event, "document")}
-                    className={`grid min-h-60 cursor-pointer place-items-center rounded-xl border border-dashed bg-canvas p-6 text-center transition ${dragging === "document" ? "border-accent bg-accent/10 shadow-[0_0_35px_rgb(var(--accent)/.12)]" : "border-line hover:border-accent"}`}
+                    className={`grid min-h-48 sm:min-h-60 cursor-pointer place-items-center rounded-xl border border-dashed bg-canvas p-4 sm:p-6 text-center transition ${dragging === "document" ? "border-accent bg-accent/10 shadow-[0_0_35px_rgb(var(--accent)/.12)]" : "border-line hover:border-accent"}`}
                   >
                     <input
                       ref={documentInput}
@@ -708,7 +766,7 @@ export function Analyzer() {
                 onClick={submit}
                 whileHover={{ scale: 1.02, y: -1 }}
                 whileTap={{ scale: 0.98 }}
-                className="button-primary mt-6 cursor-pointer"
+                className="button-primary mt-6 w-full sm:w-auto cursor-pointer"
               >
                 <ScanSearch size={17} />
                 {tab === "document"
