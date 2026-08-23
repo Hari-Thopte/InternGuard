@@ -139,16 +139,24 @@ export function Analyzer() {
     setDocumentFile(null);
     setDuplicateDocument(null);
     if (!selected) return;
+    const docxMime =
+      selected.type ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+      selected.type === "application/x-docx" ||
+      selected.type === "application/msword" ||
+      selected.type === "application/zip";
     const supportedType =
       selected.type === "application/pdf" ||
+      docxMime ||
       /^image\/(png|jpeg|webp)$/i.test(selected.type);
     const missingGenericType =
       !selected.type || selected.type === "application/octet-stream";
     const supported =
       supportedType ||
-      (missingGenericType && /\.(pdf|png|jpe?g|webp)$/i.test(selected.name));
+      (missingGenericType && /\.(pdf|docx?|png|jpe?g|webp)$/i.test(selected.name)) ||
+      /\.docx?$/i.test(selected.name);
     if (!supported) {
-      setError("Choose a PDF, PNG, JPEG, or WebP document.");
+      setError("Choose a PDF, DOCX, PNG, JPEG, or WebP document.");
       if (documentInput.current) documentInput.current.value = "";
       return;
     }
